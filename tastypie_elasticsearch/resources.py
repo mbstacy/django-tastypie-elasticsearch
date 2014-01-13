@@ -17,7 +17,8 @@ from tastypie import http
 from tastypie.bundle import Bundle
 from tastypie.fields import NOT_PROVIDED
 from tastypie.resources import Resource, DeclarativeMetaclass, convert_post_to_patch
-from tastypie.exceptions import NotFound, ImmediateHttpResponse
+from tastypie.exceptions import InvalidSortError, ImmediateHttpResponse, Unauthorized
+from tastypie.exceptions import NotFound, BadRequest, InvalidFilterError, HydrationError
 from tastypie.utils import dict_strip_unicode_keys, trailing_slash
 
 import elasticsearch
@@ -50,6 +51,7 @@ class ElasticsearchDeclarativeMetaclass(DeclarativeMetaclass):
             'create_if_missing': False,
             'index_settings': {},
             'write_index': None,
+
         }
         for k,v in override.iteritems():
             setattr(new_class._meta, k, v)
@@ -95,7 +97,8 @@ class ElasticsearchResource(Resource):
 
             self._es = elasticsearch.Elasticsearch(hosts=hosts, 
                                                    connection_class=self._meta.es_connection_class,
-                                                   timeout=self._meta.es_timeout)
+                                                   timeout=self._meta.es_timeout,
+                                                   )
         return self._es
     client = property(es__get)
 
@@ -161,6 +164,113 @@ class ElasticsearchResource(Resource):
         bundle.obj.update(bundle.data)
         return bundle
 
+    def unauthorized_result(self, exception):
+        raise ImmediateHttpResponse(response=http.HttpUnauthorized())
+
+    def authorized_read_list(self, object_list, bundle):
+        """
+        Handles checking of permissions to see if the user has authorization
+        to GET this resource.
+        """
+        try:
+            auth_result = self._meta.authorization.read_list(object_list, bundle)
+        except Unauthorized as e:
+            self.unauthorized_result(e)
+
+        return auth_result
+
+    def authorized_read_detail(self, object_list, bundle):
+        """
+        Handles checking of permissions to see if the user has authorization
+        to GET this resource.
+        """
+        try:
+            auth_result = self._meta.authorization.read_detail(object_list, bundle)
+            if not auth_result is True:
+                raise Unauthorized("User is unauthorized")
+        except Unauthorized as e:
+            self.unauthorized_result(e)
+
+        return auth_result
+
+    def authorized_create_list(self, object_list, bundle):
+        """
+        Handles checking of permissions to see if the user has authorization
+        to POST this resource.
+        """
+        try:
+            auth_result = self._meta.authorization.create_list(object_list, bundle)
+        except Unauthorized as e:
+            self.unauthorized_result(e)
+
+        return auth_result
+
+    def authorized_create_detail(self, object_list, bundle):
+        """
+        Handles checking of permissions to see if the user has authorization
+        to POST this resource.
+        """
+        try:
+            auth_result = self._meta.authorization.create_detail(object_list, bundle)
+            if not auth_result is True:
+                raise Unauthorized()
+        except Unauthorized as e:
+            self.unauthorized_result(e)
+
+        return auth_result
+
+    def authorized_update_list(self, object_list, bundle):
+        """
+        Handles checking of permissions to see if the user has authorization
+        to PUT this resource.
+        """
+        try:
+            auth_result = self._meta.authorization.update_list(object_list, bundle)
+        except Unauthorized as e:
+            self.unauthorized_result(e)
+
+        return auth_result
+
+    def authorized_update_detail(self, object_list, bundle):
+        """
+        Handles checking of permissions to see if the user has authorization
+        to PUT this resource.
+        """
+        try:
+            auth_result = self._meta.authorization.update_detail(object_list, bundle)
+            if not auth_result is True:
+                raise Unauthorized()
+        except Unauthorized as e:
+            self.unauthorized_result(e)
+
+        return auth_result
+
+    def authorized_delete_list(self, object_list, bundle):
+        """
+        Handles checking of permissions to see if the user has authorization
+        to DELETE this resource.
+        """
+        try:
+            auth_result = self._meta.authorization.delete_list(object_list, bundle)
+        except Unauthorized as e:
+            self.unauthorized_result(e)
+
+        return auth_result
+
+    def authorized_delete_detail(self, object_list, bundle):
+        """
+        Handles checking of permissions to see if the user has authorization
+        to DELETE this resource.
+        """
+        try:
+            auth_result = self._meta.authorization.delete_detail(object_list, bundle)
+            if not auth_result:
+                raise Unauthorized()
+        except Unauthorized as e:
+            self.unauthorized_result(e)
+
+        return auth_result
+
     def get_resource_uri(self, bundle_or_obj=None):
         if bundle_or_obj is None:
             result = super(ElasticsearchResource, self).get_resource_uri(bundle_or_obj)
@@ -197,21 +307,42 @@ class ElasticsearchResource(Resource):
     def build_query(self, request):
         sort = self.get_sorting(request)
         query = []
+        req_get = request.GET.copy()
 
-        for key, value in request.GET.items():
+        #Set initial filter based on authorization
+        auth_filter = self.authorized_read_list(None,request)
+        if not auth_filter:
+            auth_filter=[{"query": {"match_all":{}}},]
+        else:
+            auth_filter =[auth_filter]
+        final_query = {"filtered":{
+           "query": {"match_all":{}},
+           "filter": {
+               "bool": {
+                   "must": auth_filter,
+                   "should": []
+                    }
+                }
+            }
+        }
+
+         #  add specific term query
+        for key, value in req_get.items(): #request.GET.items():
             if key not in ["offset", "limit", "query_type", "format", 'order_by']:
                 q = {".".join([self._meta.doc_type, key]): value}
-                query.append({"text":q})
+                final_query['filtered']['filter']['bool']['must'].append({"term":q})
 
         if len(query) is 0:
             # show all
             query.append({"match_all": {}})
-        
+
         result = {
             "from": long(request.GET.get("offset", 0)),
             "size": long(request.GET.get("limit", self._meta.limit)),
             "sort": sort or [],
+            "query":final_query
         }
+        #print final_query
         # extend result dict if body is present
         if request.body:
             result.update(json.loads(request.body))
@@ -231,13 +362,15 @@ class ElasticsearchResource(Resource):
             return ElasticsearchResult(result, kwargs)
             
     def obj_get_list(self, request=None, **kwargs):
-        # Filtering disabled for brevity...
-        return self.get_object_list(kwargs['bundle'].request)
+        # Filtering pushed to build self.build_query
+        return  self.get_object_list(kwargs['bundle'].request)
 
     def obj_get(self, request=None, **kwargs):
+        #self.authorized_read_detail(None,request)
         pk = kwargs.get("pk")
         try:
             result =  self.client.get(self._meta.index, pk, self._meta.doc_type)
+            self.authorized_read_detail([result], kwargs['bundle'])
         except elasticsearch.exceptions.NotFoundError, exc:
             response = http.HttpNotFound("Not found", content_type="text/plain")
             raise ImmediateHttpResponse(response)
@@ -253,6 +386,9 @@ class ElasticsearchResource(Resource):
         bundle = self.full_hydrate(bundle)
         pk = kwargs.get("pk", bundle.obj.get("_id"))
 
+        #add authorization to obj_create
+        self.authorized_create_detail(bundle.obj, bundle)
+
         result = self.client.index(self._meta.index, self._meta.doc_type, bundle.obj, 
                                    id=pk, refresh=True)
         result.update(bundle.obj)
@@ -262,19 +398,26 @@ class ElasticsearchResource(Resource):
         bundle.obj = dict(kwargs)
         bundle = self.full_hydrate(bundle)
         pk = kwargs.get('pk', bundle.obj.get('_id'))
-        result = self.client.update(self._meta.index, self._meta.doc_type, 
-                                    bundle.obj, id=pk, refresh=True)
+        bundle.data['org']=self.client.get(self._meta.index, pk, self._meta.doc_type)
+        self.authorized_update_detail(bundle.obj,bundle)
+        result = self.client.update(self._meta.index, self._meta.doc_type,
+                                    body=bundle.obj, id=pk, refresh=True)
         result.update(bundle.obj)
         return result
     
     def obj_delete_list(self, request=None, **kwargs):
         pk = kwargs.get('pk')
         query = request.body
+        bundle = kwargs.get('bundle')
+        self.authorized_delete_list(query,bundle)
         result = self.client.delete_by_query(self._meta.index, self._meta.doc_type, query)
         return result
 
     def obj_delete(self, request=None, **kwargs):
         pk = kwargs.get('pk')
+        bundle = kwargs.get('bundle')
+        data =self.client.get(self._meta.index, pk, self._meta.doc_type)
+        self.authorized_delete_detail(data,bundle)
         result = self.client.delete(self._meta.index, self._meta.doc_type, id=pk)
         return result
 
@@ -346,6 +489,10 @@ class ElasticsearchResource(Resource):
         Substitute appropriate names for ``objects`` and
         ``deleted_objects`` if ``Meta.collection_name`` is set to something
         other than ``objects`` (default).
+
+        Authorization not implemented deactivated Patch method within resources
+        TODO LIST!!!!
+
         """
         request = convert_post_to_patch(request)
         deserialized = self.deserialize(request, request.body, format=request.META.get('CONTENT_TYPE', 'application/json'))
